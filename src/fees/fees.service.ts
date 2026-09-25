@@ -5,34 +5,13 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
-import Decimal from 'decimal.js';
 import { AssessmentCase } from '../entities/assessment-case.entity';
 import { GradeEffectivePeriod } from '../entities/grade-period.entity';
 import { FeeRateVersion } from '../entities/fee-rate-version.entity';
-import { GradeCode } from '../common/enums';
-import {
-  addDays,
-  diffDays,
-  inclusiveDays,
-  isValidDate,
-} from '../common/date.util';
-import { dailyTimesRate, moneyText } from '../common/money.util';
+import { diffDays, isValidDate } from '../common/date.util';
+import { computeDaily, Segment } from '../common/fee-calc.util';
 
-export interface FeeSegment {
-  startDate: string;
-  endDate: string;
-  days: number;
-  grade: GradeCode | null;
-  dailyRate: string | null;
-  amount: string;
-  source:
-    | 'GRADE_PERIOD_AND_RATE'
-    | 'GRADE_PERIOD_NO_RATE'
-    | 'NO_EFFECTIVE_GRADE';
-  gradePeriodId: string | null;
-  rateEffectiveFrom: string | null;
-  note: string;
-}
+export type FeeSegment = Segment;
 
 @Injectable()
 export class FeesService {
@@ -66,7 +45,9 @@ export class FeesService {
       });
     }
 
-    const assessmentCase = await this.caseRepo.findOne({ where: { id: caseId } });
+    const assessmentCase = await this.caseRepo.findOne({
+      where: { id: caseId },
+    });
     if (!assessmentCase) throw new NotFoundException('评估案件不存在');
     if (!assessmentCase.confirmedGrade) {
       throw new ConflictException({
@@ -177,15 +158,23 @@ export class FeesService {
 
   /**
    * 按天分段费用（闭区间 [from,to]，含首尾）：
-   *  1) 取该老人与查询区间相交的等级期间，切成“天 × 等级”覆盖；
-   *  2) 每段等级再按日费版本切换日拆分；
-   *  3) decimal.js 计算 天数×日费 与合计；无生效等级的天空洞单列、金额 0。
+   *  1) 取该老人与查询区间相交的等级期间，逐天确定当天等级；
+   *  2) 每天按 effectiveFrom 选当日生效日费版本；
+   *  3) 逐日折叠成解释分段，decimal.js 计算合计；无生效等级的天空洞单列、金额 0。
+   * 与月度账单共用 computeDaily 同一计费口径（含快照回放）。
    */
   async feeSegments(
     elderId: string,
     from: string,
     to: string,
-  ): Promise<{ elderId: string; from: string; to: string; totalDays: number; totalAmount: string; segments: FeeSegment[] }> {
+  ): Promise<{
+    elderId: string;
+    from: string;
+    to: string;
+    totalDays: number;
+    totalAmount: string;
+    segments: FeeSegment[];
+  }> {
     if (!isValidDate(from) || !isValidDate(to) || from > to) {
       throw new ConflictException({
         code: 'INVALID_RANGE',
@@ -201,121 +190,28 @@ export class FeesService {
       order: { effectiveFrom: 'ASC' },
     });
 
-    // 1) 等级覆盖轴：闭区间片段 [{start,end,grade,periodId}]，grade/periodId 允许为空（空洞）
-    type CoverPiece = {
-      start: string;
-      end: string;
-      grade: GradeCode | null;
-      periodId: string | null;
-    };
-    const cover: CoverPiece[] = [];
-    for (const p of periods) {
-      const pEndInclusive = p.endDateExclusive
-        ? addDays(p.endDateExclusive, -1)
-        : to; // 开放区间在查询范围内取 to
-      const s = p.startDate > from ? p.startDate : from;
-      const e = pEndInclusive < to ? pEndInclusive : to;
-      if (s <= e) {
-        cover.push({ start: s, end: e, grade: p.grade, periodId: p.id });
-      }
-    }
-    cover.sort((a, b) => (a.start < b.start ? -1 : 1));
+    const calc = computeDaily(
+      periods.map((p) => ({
+        id: p.id,
+        grade: p.grade,
+        startDate: p.startDate,
+        endDateExclusive: p.endDateExclusive,
+      })),
+      rateVersions.map((r) => ({
+        id: r.id,
+        grade: r.grade,
+        effectiveFrom: r.effectiveFrom,
+        dailyRate: r.dailyRate,
+        note: r.note,
+      })),
+      from,
+      to,
+    );
 
-    // 2) 填充无生效等级的空洞，保证逐天连续
-    const merged: CoverPiece[] = [];
-    let cursor = from;
-    for (const c of cover) {
-      if (c.start > cursor) {
-        merged.push({ start: cursor, end: addDays(c.start, -1), grade: null, periodId: null });
-      }
-      merged.push(c);
-      cursor = c.end < cursor ? cursor : addDays(c.end, 1);
-    }
-    if (cursor <= to) {
-      merged.push({ start: cursor, end: to, grade: null, periodId: null });
-    }
-
-    // 3) 按日费版本切换日二次切分
-    const segments: FeeSegment[] = [];
-    let total = new Decimal(0);
-    let totalDays = 0;
-
-    for (const m of merged) {
-      totalDays += inclusiveDays(m.start, m.end);
-      if (!m.grade) {
-        segments.push({
-          startDate: m.start,
-          endDate: m.end,
-          days: inclusiveDays(m.start, m.end),
-          grade: null,
-          dailyRate: null,
-          amount: moneyText(0),
-          source: 'NO_EFFECTIVE_GRADE',
-          gradePeriodId: null,
-          rateEffectiveFrom: null,
-          note: '无生效等级：不计费',
-        });
-        continue;
-      }
-
-      const versions = rateVersions
-        .filter(
-          (r) => r.grade === m.grade && r.effectiveFrom <= m.end,
-        )
-        .sort((a, b) => (a.effectiveFrom < b.effectiveFrom ? -1 : 1));
-
-      let segStart = m.start;
-      for (let i = 0; i < versions.length; i++) {
-        const v = versions[i];
-        const nextV = versions[i + 1];
-        const vStart = v.effectiveFrom < segStart ? segStart : v.effectiveFrom;
-        if (vStart > m.end) break;
-        const vEndInclusive = nextV
-          ? minString(addDays(nextV.effectiveFrom, -1), m.end)
-          : m.end;
-        if (vStart > vEndInclusive) continue;
-
-        // 该版本是否覆盖段首，否则只是存在更早版本（已被 vStart 修正）
-        const days = inclusiveDays(vStart, vEndInclusive);
-        const amount = dailyTimesRate(v.dailyRate, days);
-        total = total.plus(amount);
-        segments.push({
-          startDate: vStart,
-          endDate: vEndInclusive,
-          days,
-          grade: m.grade,
-          dailyRate: moneyText(v.dailyRate),
-          amount: moneyText(amount),
-          source: 'GRADE_PERIOD_AND_RATE',
-          gradePeriodId: m.periodId,
-          rateEffectiveFrom: v.effectiveFrom,
-          note: `${m.grade} 等级期间 × 日费版本自 ${v.effectiveFrom} 起（${v.note ?? ''}）`,
-        });
-        segStart = addDays(vEndInclusive, 1);
-      }
-
-      // 等级存在但机构未定义任何日费规则
-      if (!versions.length) {
-        segments.push({
-          startDate: m.start,
-          endDate: m.end,
-          days: inclusiveDays(m.start, m.end),
-          grade: m.grade,
-          dailyRate: null,
-          amount: moneyText(0),
-          source: 'GRADE_PERIOD_NO_RATE',
-          gradePeriodId: m.periodId,
-          rateEffectiveFrom: null,
-          note: `等级 ${m.grade} 已生效但机构示例规则未定义日费：暂不计费`,
-        });
-      }
-    }
-
-    // 校验天数守恒（分段天数之和必须等于区间总天数）
-    const segDays = segments.reduce((s, x) => s + x.days, 0);
-    if (segDays !== diffDays(to, from) + 1) {
+    // 天数守恒（computeDaily 已逐日守恒；此处保留对外一致的错误口径）
+    if (calc.totalDays !== diffDays(to, from) + 1) {
       throw new Error(
-        `费用分段天数不一致：分段 ${segDays} 天，区间 ${diffDays(to, from) + 1} 天`,
+        `费用分段天数不一致：分段 ${calc.totalDays} 天，区间 ${diffDays(to, from) + 1} 天`,
       );
     }
 
@@ -323,13 +219,9 @@ export class FeesService {
       elderId,
       from,
       to,
-      totalDays,
-      totalAmount: moneyText(total),
-      segments,
+      totalDays: calc.totalDays,
+      totalAmount: calc.totalAmount,
+      segments: calc.segments,
     };
   }
-}
-
-function minString(a: string, b: string): string {
-  return a < b ? a : b;
 }

@@ -1,0 +1,658 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "养老评估-复核-告知-费用生效与月度账单闭环 API",
+    "version": "1.1.0",
+    "description": "虚构量表行政流程演示（非医疗诊断）。月度账单：DRAFT 草稿 → TRIALED 已试算 → SEALED 已封账；封账后重开旧版本 → REOPENED 已重开，并从原快照派生新版本；新版本封账后旧版本 → SUPERSEDED 已替代。封账冻结等级期间、日费版本、告知记录与逐日明细快照；后续数据变化不静默改写已封账金额，仅经差异查询生成跨期调整建议。所有接口位于 /api 前缀下。"
+  },
+  "tags": [
+    { "name": "bills", "description": "月度账单闭环：试算/封账/重开/差异/版本链" },
+    { "name": "fees", "description": "等级生效与逐日分段费用（未封账实时查询，保持兼容）" },
+    { "name": "assessments", "description": "评估、复核、告知" }
+  ],
+  "paths": {
+    "/bills": {
+      "post": {
+        "tags": ["bills"],
+        "summary": "创建（或幂等回放）月度账单草稿",
+        "description": "同一老人月份已有开放版本（DRAFT/TRIALED）时回放该版本（replayed=true）；已存在有效封账版本返回 409 MONTH_ALREADY_SEALED，必须先重开。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateBillRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "草稿创建或回放",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "replayed": { "type": "boolean" },
+                    "bill": { "$ref": "#/components/schemas/MonthlyBill" }
+                  },
+                  "required": ["replayed", "bill"]
+                }
+              }
+            }
+          },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      },
+      "get": {
+        "tags": ["bills"],
+        "summary": "账单列表",
+        "parameters": [
+          { "name": "elderId", "in": "query", "schema": { "type": "string" } },
+          { "name": "billMonth", "in": "query", "schema": { "type": "string", "pattern": "^\\d{4}-(0[1-9]|1[0-2])$" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "账单版本列表（含全部历史版本）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/MonthlyBill" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bills/chain/{elderId}/{billMonth}": {
+      "get": {
+        "tags": ["bills"],
+        "summary": "版本链回放",
+        "description": "返回该老人该月全部版本（按版本号）、predecessor/successor 派生关系，以及当前唯一有效封账版本 inForceBillId（无则为 null）。",
+        "parameters": [
+          { "name": "elderId", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "billMonth", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^\\d{4}-(0[1-9]|1[0-2])$" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "版本链",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/BillChain" }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/bills/adjustments": {
+      "get": {
+        "tags": ["bills"],
+        "summary": "跨期调整建议列表",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "schema": { "type": "string", "enum": ["OPEN", "SUPERSEDED"] },
+            "description": "OPEN=待跨期处理；SUPERSEDED=已被后续封账版本吸收"
+          },
+          { "name": "billId", "in": "query", "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "调整建议",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/AdjustmentSuggestion" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bills/{id}": {
+      "get": {
+        "tags": ["bills"],
+        "summary": "账单详情（含封账快照摘要与逐日明细）",
+        "parameters": [{ "$ref": "#/components/parameters/BillId" }],
+        "responses": {
+          "200": {
+            "description": "账单详情",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/BillDetail" }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/bills/{id}/lines": {
+      "get": {
+        "tags": ["bills"],
+        "summary": "逐日明细（每日来源可回放）",
+        "description": "月内每天一行：grade + gradePeriodId（等级期间来源）+ rateVersionId/rateEffectiveFrom（日费版本来源）+ source + amount。",
+        "parameters": [{ "$ref": "#/components/parameters/BillId" }],
+        "responses": {
+          "200": {
+            "description": "逐日明细",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/BillLines" }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/bills/{id}/diff": {
+      "get": {
+        "tags": ["bills"],
+        "summary": "差异查询：生成跨期调整建议（不改写封账金额）",
+        "description": "以封账快照逐日明细为旧账，按当前实时等级期间/日费版本逐日重算比对：费率补录→RATE_BACKFILL；评估更正导致等级变化→GRADE_PERIOD_CHANGE。相邻同类型同方向天聚合为建议并持久化（OPEN）。重复查询幂等刷新。仅已封账/已重开/已替代版本可查。",
+        "parameters": [{ "$ref": "#/components/parameters/BillId" }],
+        "responses": {
+          "200": {
+            "description": "差异与建议",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/BillDiff" }
+              }
+            }
+          },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/bills/{id}/trial": {
+      "post": {
+        "tags": ["bills"],
+        "summary": "试算/重算（DRAFT/TRIALED → TRIALED）",
+        "description": "按当前实时数据整月逐日计费：先在内存完成计算，事务内整删整插明细；任何失败（含 simulateRecomputeFailure 注入）整体回滚，不留半套明细，并在 lastRecomputeError 记录原因。",
+        "parameters": [{ "$ref": "#/components/parameters/BillId" }],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "simulateRecomputeFailure": {
+                    "type": "boolean",
+                    "description": "故障注入：模拟重算失败（演示失败不留半套明细）"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "试算结果（账单 + 分段 + 逐日）",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TrialResult" }
+              }
+            }
+          },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/bills/{id}/seal": {
+      "post": {
+        "tags": ["bills"],
+        "summary": "封账（TRIALED → SEALED）",
+        "description": "封账前校验：必须已试算；试算后等级期间/日费版本若变化（指纹不一致）拒绝并要求重新试算；逐日明细必须完整且金额一致。通过后冻结快照（期间、日费版本、告知记录）与逐日明细。重开派生版本封账时旧 REOPENED 版本转 SUPERSEDED，旧开放建议置 SUPERSEDED。重复/并发封账仅一个版本有效（advisory lock + 部分唯一索引）。",
+        "parameters": [{ "$ref": "#/components/parameters/BillId" }],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "sealedBy": { "type": "string", "maxLength": 64 }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "封账完成",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "bill": { "$ref": "#/components/schemas/MonthlyBill" },
+                    "snapshotSummary": { "$ref": "#/components/schemas/SnapshotSummary" }
+                  },
+                  "required": ["bill", "snapshotSummary"]
+                }
+              }
+            }
+          },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/bills/{id}/reopen": {
+      "post": {
+        "tags": ["bills"],
+        "summary": "重开已封账版本（SEALED → REOPENED，派生新版本 DRAFT）",
+        "description": "必须给出原因。旧版本保留全部冻结快照与金额（状态 REOPENED，仍可查、可作为兜底）；新版本从旧快照逐日明细整行复制派生（versionNo+1）。随后对新版本试算（按当前实时数据）并封账。并发/重复重开由事务 advisory lock + 行锁 + 部分唯一索引拦截。",
+        "parameters": [{ "$ref": "#/components/parameters/BillId" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ReopenRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "重开完成，返回旧版本与新版本草稿",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "predecessor": { "$ref": "#/components/schemas/MonthlyBill" },
+                    "bill": { "$ref": "#/components/schemas/MonthlyBill" }
+                  },
+                  "required": ["predecessor", "bill"]
+                }
+              }
+            }
+          },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/fees/activate": {
+      "post": {
+        "tags": ["fees"],
+        "summary": "等级生效",
+        "description": "未封账费用流程不受账单影响：仍可生效等级；已封账月份若发生期间变化，只在账单差异查询中体现为调整建议。",
+        "responses": { "201": { "description": "生效结果" }, "409": { "$ref": "#/components/responses/Conflict" } }
+      }
+    },
+    "/fees/segments": {
+      "get": {
+        "tags": ["fees"],
+        "summary": "逐日分段费用（实时查询，结果结构保持兼容）",
+        "parameters": [
+          { "name": "elderId", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "from", "in": "query", "required": true, "schema": { "type": "string", "format": "date" } },
+          { "name": "to", "in": "query", "required": true, "schema": { "type": "string", "format": "date" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "分段费用（totalDays/totalAmount/segments 结构不变）",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/FeeSegments" }
+              }
+            }
+          },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "BillId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "string", "format": "uuid" }
+      }
+    },
+    "responses": {
+      "Conflict": {
+        "description": "业务冲突（错误体含 code）",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "statusCode": { "type": "integer", "example": 409 },
+                "message": {
+                  "oneOf": [
+                    { "type": "string" },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "MONTH_ALREADY_SEALED",
+                            "BILL_ALREADY_SEALED",
+                            "BILL_ALREADY_REOPENED",
+                            "BILL_NOT_SEALED",
+                            "BILL_NOT_TRIALED",
+                            "BILL_NOT_TRIALABLE",
+                            "BILL_SUPERSEDED",
+                            "BILL_SOURCE_CHANGED_AFTER_TRIAL",
+                            "BILL_LINES_INCOMPLETE",
+                            "BILL_RECOMPUTE_FAILED",
+                            "REOPEN_REASON_REQUIRED",
+                            "BILL_OPEN_VERSION_EXISTS",
+                            "BILL_VERSION_CONFLICT",
+                            "INVALID_BILL_MONTH"
+                          ]
+                        },
+                        "message": { "type": "string" }
+                      }
+                    }
+                  ]
+                },
+                "error": { "type": "string", "example": "Conflict" }
+              }
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "账单不存在",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "statusCode": { "type": "integer", "example": 404 },
+                "message": { "type": "string" },
+                "error": { "type": "string", "example": "Not Found" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "CreateBillRequest": {
+        "type": "object",
+        "required": ["elderId", "billMonth"],
+        "properties": {
+          "elderId": { "type": "string", "maxLength": 64 },
+          "billMonth": { "type": "string", "pattern": "^\\d{4}-(0[1-9]|1[0-2])$", "example": "2024-02" }
+        }
+      },
+      "ReopenRequest": {
+        "type": "object",
+        "required": ["reason"],
+        "properties": {
+          "reason": { "type": "string", "minLength": 2, "maxLength": 500, "description": "重开原因（必填）" },
+          "reopenedBy": { "type": "string", "maxLength": 64 },
+          "simulateRecomputeFailure": { "type": "boolean" }
+        }
+      },
+      "MonthlyBill": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "elderId": { "type": "string" },
+          "billMonth": { "type": "string", "example": "2024-02" },
+          "versionNo": { "type": "integer", "example": 1 },
+          "status": {
+            "type": "string",
+            "enum": ["DRAFT", "TRIALED", "SEALED", "REOPENED", "SUPERSEDED"]
+          },
+          "totalDays": { "type": "integer" },
+          "totalAmount": { "type": "string", "description": "decimal 两位小数", "example": "5900.00" },
+          "sourceFingerprint": { "type": "string", "description": "期间+日费来源 SHA-256" },
+          "predecessorId": { "type": "string", "format": "uuid", "nullable": true },
+          "successorId": { "type": "string", "format": "uuid", "nullable": true },
+          "reopenReason": { "type": "string", "nullable": true },
+          "reopenedBy": { "type": "string", "nullable": true },
+          "reopenedAt": { "type": "string", "format": "date-time", "nullable": true },
+          "sealedBy": { "type": "string", "nullable": true },
+          "sealedAt": { "type": "string", "format": "date-time", "nullable": true },
+          "lastRecomputeError": { "type": "string", "nullable": true },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "updatedAt": { "type": "string", "format": "date-time" },
+          "hasSnapshot": { "type": "boolean" },
+          "inForce": { "type": "boolean", "description": "是否当前唯一有效封账版本（SEALED）" }
+        },
+        "required": ["id", "elderId", "billMonth", "versionNo", "status", "totalDays", "totalAmount", "inForce"]
+      },
+      "SnapshotSummary": {
+        "type": "object",
+        "description": "封账冻结快照：等级期间、日费版本、告知记录",
+        "properties": {
+          "sealedAt": { "type": "string", "format": "date-time" },
+          "sealedBy": { "type": "string", "nullable": true },
+          "monthFrom": { "type": "string", "format": "date" },
+          "monthTo": { "type": "string", "format": "date" },
+          "fingerprint": { "type": "string" },
+          "derivedFromBillId": { "type": "string", "format": "uuid", "nullable": true },
+          "periodsCount": { "type": "integer" },
+          "ratesCount": { "type": "integer" },
+          "notificationsCount": { "type": "integer" },
+          "periods": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "grade": { "type": "string" },
+                "startDate": { "type": "string", "format": "date" },
+                "endDateExclusive": { "type": "string", "format": "date", "nullable": true },
+                "sourceCaseId": { "type": "string" }
+              }
+            }
+          },
+          "rates": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "grade": { "type": "string" },
+                "effectiveFrom": { "type": "string", "format": "date" },
+                "dailyRate": { "type": "string" },
+                "note": { "type": "string", "nullable": true }
+              }
+            }
+          },
+          "notifications": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "assessmentCaseId": { "type": "string" },
+                "status": { "type": "string", "enum": ["PENDING", "DELIVERED", "FAILED"] },
+                "notifiableStatus": { "type": "string", "enum": ["CONFIRMED", "UNCONFIRMED"] },
+                "message": { "type": "string", "nullable": true },
+                "failureReason": { "type": "string", "nullable": true },
+                "attempts": { "type": "integer" },
+                "createdAt": { "type": "string", "nullable": true },
+                "lastAttemptAt": { "type": "string", "nullable": true }
+              }
+            }
+          }
+        }
+      },
+      "DailyLine": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "date": { "type": "string", "format": "date" },
+          "grade": { "type": "string", "nullable": true },
+          "dailyRate": { "type": "string", "nullable": true, "example": "300.00" },
+          "amount": { "type": "string", "example": "300.00" },
+          "source": {
+            "type": "string",
+            "enum": ["GRADE_PERIOD_AND_RATE", "GRADE_PERIOD_NO_RATE", "NO_EFFECTIVE_GRADE"]
+          },
+          "gradePeriodId": { "type": "string", "format": "uuid", "nullable": true },
+          "rateVersionId": { "type": "string", "format": "uuid", "nullable": true },
+          "rateEffectiveFrom": { "type": "string", "format": "date", "nullable": true },
+          "note": { "type": "string" }
+        },
+        "required": ["date", "source", "amount"]
+      },
+      "BillLines": {
+        "type": "object",
+        "properties": {
+          "billId": { "type": "string", "format": "uuid" },
+          "status": { "type": "string" },
+          "versionNo": { "type": "integer" },
+          "billMonth": { "type": "string" },
+          "totalDays": { "type": "integer" },
+          "totalAmount": { "type": "string" },
+          "daily": { "type": "array", "items": { "$ref": "#/components/schemas/DailyLine" } }
+        },
+        "required": ["billId", "status", "daily"]
+      },
+      "BillDetail": {
+        "type": "object",
+        "properties": {
+          "bill": { "$ref": "#/components/schemas/MonthlyBill" },
+          "snapshotSummary": {
+            "oneOf": [{ "$ref": "#/components/schemas/SnapshotSummary" }, { "type": "null" }]
+          },
+          "daily": { "type": "array", "items": { "$ref": "#/components/schemas/DailyLine" } }
+        },
+        "required": ["bill", "daily"]
+      },
+      "TrialResult": {
+        "type": "object",
+        "properties": {
+          "bill": { "$ref": "#/components/schemas/MonthlyBill" },
+          "segments": { "type": "array", "items": { "$ref": "#/components/schemas/FeeSegment" } },
+          "daily": { "type": "array", "items": { "$ref": "#/components/schemas/DailyLine" } }
+        },
+        "required": ["bill", "daily"]
+      },
+      "AdjustmentSuggestion": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "billId": { "type": "string", "format": "uuid" },
+          "changeType": {
+            "type": "string",
+            "enum": ["RATE_BACKFILL", "GRADE_PERIOD_CHANGE"]
+          },
+          "fromDate": { "type": "string", "format": "date" },
+          "toDate": { "type": "string", "format": "date" },
+          "days": { "type": "integer" },
+          "sealedAmount": { "type": "string", "description": "封账口径（旧账，冻结）" },
+          "currentAmount": { "type": "string", "description": "当前实时口径（重算）" },
+          "deltaAmount": { "type": "string", "description": "current - sealed，正补收/负退减" },
+          "reason": { "type": "string" },
+          "status": { "type": "string", "enum": ["OPEN", "SUPERSEDED"] },
+          "supersededByBillId": { "type": "string", "format": "uuid", "nullable": true },
+          "supersededAt": { "type": "string", "format": "date-time", "nullable": true },
+          "createdAt": { "type": "string", "format": "date-time" }
+        },
+        "required": ["id", "billId", "changeType", "fromDate", "toDate", "days", "sealedAmount", "currentAmount", "deltaAmount", "reason", "status"]
+      },
+      "DayDiff": {
+        "type": "object",
+        "properties": {
+          "date": { "type": "string", "format": "date" },
+          "changeType": { "type": "string", "enum": ["RATE_BACKFILL", "GRADE_PERIOD_CHANGE"] },
+          "sealedGrade": { "type": "string", "nullable": true },
+          "currentGrade": { "type": "string", "nullable": true },
+          "sealedAmount": { "type": "string" },
+          "currentAmount": { "type": "string" },
+          "deltaAmount": { "type": "string" },
+          "sealedRate": { "type": "string", "nullable": true },
+          "currentRate": { "type": "string", "nullable": true }
+        }
+      },
+      "BillDiff": {
+        "type": "object",
+        "properties": {
+          "billId": { "type": "string", "format": "uuid" },
+          "status": { "type": "string" },
+          "billMonth": { "type": "string" },
+          "sealedTotalAmount": { "type": "string" },
+          "currentTotalAmount": { "type": "string" },
+          "deltaAmount": { "type": "string" },
+          "suggestions": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/AdjustmentSuggestion" }
+          },
+          "daily": { "type": "array", "items": { "$ref": "#/components/schemas/DayDiff" } }
+        },
+        "required": ["billId", "status", "sealedTotalAmount", "currentTotalAmount", "deltaAmount", "suggestions", "daily"]
+      },
+      "BillChain": {
+        "type": "object",
+        "properties": {
+          "elderId": { "type": "string" },
+          "billMonth": { "type": "string" },
+          "inForceBillId": { "type": "string", "format": "uuid", "nullable": true },
+          "versions": {
+            "type": "array",
+            "items": {
+              "allOf": [
+                { "$ref": "#/components/schemas/MonthlyBill" },
+                {
+                  "type": "object",
+                  "properties": {
+                    "chainPosition": {
+                      "type": "object",
+                      "properties": {
+                        "isFirst": { "type": "boolean" },
+                        "isLatest": { "type": "boolean" },
+                        "isInForce": { "type": "boolean" }
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        },
+        "required": ["elderId", "billMonth", "inForceBillId", "versions"]
+      },
+      "FeeSegment": {
+        "type": "object",
+        "properties": {
+          "startDate": { "type": "string", "format": "date" },
+          "endDate": { "type": "string", "format": "date" },
+          "days": { "type": "integer" },
+          "grade": { "type": "string", "nullable": true },
+          "dailyRate": { "type": "string", "nullable": true },
+          "amount": { "type": "string" },
+          "source": {
+            "type": "string",
+            "enum": ["GRADE_PERIOD_AND_RATE", "GRADE_PERIOD_NO_RATE", "NO_EFFECTIVE_GRADE"]
+          },
+          "gradePeriodId": { "type": "string", "format": "uuid", "nullable": true },
+          "rateEffectiveFrom": { "type": "string", "format": "date", "nullable": true },
+          "note": { "type": "string" }
+        }
+      },
+      "FeeSegments": {
+        "type": "object",
+        "properties": {
+          "elderId": { "type": "string" },
+          "from": { "type": "string", "format": "date" },
+          "to": { "type": "string", "format": "date" },
+          "totalDays": { "type": "integer" },
+          "totalAmount": { "type": "string" },
+          "segments": { "type": "array", "items": { "$ref": "#/components/schemas/FeeSegment" } }
+        },
+        "required": ["elderId", "from", "to", "totalDays", "totalAmount", "segments"]
+      }
+    }
+  }
+}

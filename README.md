@@ -19,6 +19,17 @@ NestJS + PostgreSQL + TypeORM + decimal.js 的服务端流程。**无前端**。
 8. **费用按天分段**：等级期间 × 日费版本切换日二次切分，闭区间逐天连续（含无生效等级空洞段），天数守恒校验；金额一律 decimal.js 计算，两位小数 `ROUND_HALF_UP`。
 9. **接口可解释**：评估响应内嵌两位评估员逐项明细（原始选项、分值、是否计入分母、NA 说明、原始分/有效分母/百分比/定级阈值）；费用分段逐段给出等级、日费版本、天数、金额与来源。
 
+### 月度账单闭环（封账、重开与跨期调整）
+
+10. **账单版本状态机**：`DRAFT 草稿 → TRIALED 已试算 → SEALED 已封账`；封账后重开旧版本转为 `REOPENED 已重开`，同时从原快照派生新版本草稿；新版本封账后旧版本转为 `SUPERSEDED 已替代`。同一老人同一月份**始终至多一个 SEALED 有效版本**。
+11. **封账即冻结**：封账时冻结等级期间、日费版本、告知记录快照（`sealed_snapshot` jsonb）与逐日明细（月内每天一行的 `bill_daily_lines`）。试算后来源若再变化（指纹不一致）拒绝封账，必须重新试算；封账后等级/费率数据变化**绝不静默改写**已封账金额与明细。
+12. **跨期调整建议**：封账后补录费率（`RATE_BACKFILL`）或评估更正导致等级期间变化（`GRADE_PERIOD_CHANGE`），仅由差异查询 `GET /bills/:id/diff` 按“冻结快照逐日 vs 当前实时逐日”比对，聚合为 `bill_adjustment_suggestions` 建议（含起止日、天数、旧账金额、重算金额、差额与原因）；后续重开并封账新版本吸收差异后，旧建议置 `SUPERSEDED`。
+13. **重开必须给原因**：`reason` 必填；旧版本冻结数据保留可查（重算失败时仍是兜底），新版本从旧快照逐日明细整行派生。试算/重算先在内存完成、事务内整删整插，任何失败（含 `simulateRecomputeFailure` 注入）整体回滚，**不留半套明细**。
+14. **并发与重复防护**：事务级 `pg_advisory_xact_lock`（按老人+月份串行化）+ 行锁 `FOR UPDATE` + 部分唯一索引（`... WHERE status='SEALED'`、`... WHERE status IN ('DRAFT','TRIALED')`）三重保证；重复封账、并发重开均只一个版本有效。
+15. **可回放/可迁移**：幂等 DDL 迁移（`ensureBillingSchema`）；重启后版本链（predecessor/successor）、每日来源（`grade_period_id` + `rate_version_id`）、封账快照与调整关系均可回放。未封账的 `/fees/segments` 实时查询结果结构保持不变。
+
+> OpenAPI 3.0 文档：`docs/openapi.json`，运行后可通过 `GET /api/docs/openapi.json` 获取。
+
 ## 演示数据
 
 - 量表 `DEMO_ADL v1.0.0`：10 题（8 必填 + STAIRS/OUTDOOR 可 NA），0~3 分制；
@@ -48,7 +59,18 @@ npm test              # e2e（自带嵌入式 PG，覆盖下列全部场景）
 | POST | `/assessments/:id/notification/attempt` | 家属告知尝试（`{"simulateFail":true}` 模拟通道失败） |
 | GET | `/assessments/:id/notification` | 全部告知记录（失败历史、未确认尝试均保留） |
 | POST | `/fees/activate` | 等级生效 `{caseId, effectiveDate}` |
-| GET | `/fees/segments?elderId=&from=&to=` | 按天分段费用与 decimal 合计 |
+| GET | `/fees/segments?elderId=&from=&to=` | 按天分段费用与 decimal 合计（实时，兼容） |
+| POST | `/bills` | 创建/幂等回放月度账单草稿 `{elderId, billMonth}` |
+| GET | `/bills?elderId=&billMonth=` | 账单版本列表 |
+| GET | `/bills/chain/:elderId/:billMonth` | 版本链回放（派生关系 + 当前唯一有效版本） |
+| GET | `/bills/:id` | 账单详情：状态/汇总 + 封账快照摘要 + 逐日明细 |
+| GET | `/bills/:id/lines` | 逐日明细（每日等级期间/日费版本来源） |
+| POST | `/bills/:id/trial` | 试算/重算（可 `{"simulateRecomputeFailure":true}` 注入失败） |
+| POST | `/bills/:id/seal` | 封账 `{sealedBy?}`：冻结快照与逐日明细 |
+| POST | `/bills/:id/reopen` | 重开（`reason` 必填）：旧版 REOPENED + 派生新版本草稿 |
+| GET | `/bills/:id/diff` | 差异查询：生成跨期调整建议（不改写封账金额） |
+| GET | `/bills/adjustments?status=&billId=` | 跨期调整建议列表（OPEN / SUPERSEDED） |
+| GET | `/docs/openapi.json` | OpenAPI 3.0 文档 |
 
 ### 示例：月中升级 + 闰月
 
@@ -73,4 +95,8 @@ curl -s 'localhost:3000/api/fees/segments?elderId=E1&from=2024-02-01&to=2024-02-
 - 重复确认请求：相同幂等键回放、无键重复 409；
 - 尚未确认尝试告知 → `UNCONFIRMED/FAILED`；送达失败原因分行留痕；
 - 月中升级切旧区间、同案重复生效回放、同日不同等级重叠 409；
-- 闰月 2024-02（29 天）分段金额、跨 2024-01-01 调价日同等级二次分段、无等级空洞段、非法闰日期拒绝。
+- 闰月 2024-02（29 天）分段金额、跨 2024-01-01 调价日同等级二次分段、无等级空洞段、非法闰日期拒绝；
+- 月度账单闭环：闰月月中换级封出 29 天可解释明细并冻结快照；未试算不得封账；重复与并发封账仅一个有效版本；
+- 封账后费率补录仅产生 RATE_BACKFILL 建议、评估更正产生 GRADE_PERIOD_CHANGE 建议，原账金额/明细不变；
+- 重开必须给原因、并发重开仅一个新版本；重开后重算失败无半套明细且旧封账仍可用；新版本封账后旧版 SUPERSEDED、旧建议关闭；
+- 试算后来源变化（指纹不一致）拒绝静默封账；重启应用后版本链、每日来源、快照与调整关系可回放；未封账费用查询保持兼容。
