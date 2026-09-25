@@ -8,6 +8,10 @@ import { ReviewDecision } from '../entities/review-decision.entity';
 import { NotificationRecord } from '../entities/notification.entity';
 import { GradeEffectivePeriod } from '../entities/grade-period.entity';
 import { FeeRateVersion } from '../entities/fee-rate-version.entity';
+import { MonthlyBill } from '../entities/monthly-bill.entity';
+import { BillDailyLine } from '../entities/bill-daily-line.entity';
+import { BillAdjustmentSuggestion } from '../entities/bill-adjustment-suggestion.entity';
+import { MonthlyBillEvent } from '../entities/monthly-bill-event.entity';
 import { seedDemoData } from './seed';
 
 export const entities = [
@@ -20,6 +24,10 @@ export const entities = [
   NotificationRecord,
   GradeEffectivePeriod,
   FeeRateVersion,
+  MonthlyBill,
+  BillDailyLine,
+  BillAdjustmentSuggestion,
+  MonthlyBillEvent,
 ];
 
 export function buildDataSourceOptions(): DataSourceOptions {
@@ -36,9 +44,13 @@ export function buildDataSourceOptions(): DataSourceOptions {
 }
 
 /**
- * 幂等建表 + 防重叠排除约束（首次启动建表；后续启动只补缺）。
+ * 幂等建表 + 约束（首次启动建表；后续启动只补缺）。
  * 同一老人同一天不得出现重叠生效等级：
  *   btree_gist 提供 daterange 排他约束（半开区间，相邻期间首尾相接不算重叠）。
+ * 月度账单版本约束：
+ *   - 同老人同月份最多一个工作版本（DRAFT/TRIALED）、最多一个有效封账（CLOSED）；
+ *   - OPEN 调整建议在 账单×类型×自然日 上唯一；
+ *   服务层事务 + 行锁先行，部分唯一索引为并发最终防线。
  */
 export async function ensureSchema(dataSource: DataSource): Promise<void> {
   await dataSource.query('CREATE EXTENSION IF NOT EXISTS btree_gist');
@@ -48,6 +60,14 @@ export async function ensureSchema(dataSource: DataSource): Promise<void> {
   );
   if (!exists[0].ok) {
     await dataSource.synchronize();
+  } else {
+    // 旧库升级：账单相关新表由 synchronize 幂等补齐（只建不存在的表）
+    const billsExist = await dataSource.query(
+      `SELECT to_regclass('monthly_bills') IS NOT NULL AS ok`,
+    );
+    if (!billsExist[0].ok) {
+      await dataSource.synchronize();
+    }
   }
 
   const constraint = await dataSource.query(
@@ -63,6 +83,33 @@ export async function ensureSchema(dataSource: DataSource): Promise<void> {
         )
     `);
   }
+
+  // ---- 月度账单闭环：幂等索引（IF NOT EXISTS 支持重复启动/旧库迁移） ----
+  await dataSource.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS monthly_bills_one_working_version
+      ON monthly_bills (elder_id, bill_month)
+      WHERE status IN ('DRAFT', 'TRIALED')
+  `);
+  await dataSource.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS monthly_bills_one_active_closed
+      ON monthly_bills (elder_id, bill_month)
+      WHERE status = 'CLOSED'
+  `);
+  await dataSource.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS bill_adjustment_suggestions_one_open
+      ON bill_adjustment_suggestions (bill_id, adjustment_type, line_date)
+      WHERE status = 'OPEN'
+  `);
+
+  // 封账合法性：CLOSED 必须带快照；有快照意味着金额已冻结（状态守卫见服务层）
+  await dataSource.query(`
+    ALTER TABLE monthly_bills DROP CONSTRAINT IF EXISTS monthly_bills_closed_needs_snapshot
+  `);
+  await dataSource.query(`
+    ALTER TABLE monthly_bills
+      ADD CONSTRAINT monthly_bills_closed_needs_snapshot
+      CHECK (status <> 'CLOSED' OR snapshot IS NOT NULL)
+  `);
 }
 
 let singleton: Promise<DataSource> | null = null;

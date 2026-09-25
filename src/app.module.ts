@@ -12,6 +12,8 @@ import { AssessmentsModule } from './assessments/assessments.module';
 import { ReviewsModule } from './reviews/reviews.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { FeesModule } from './fees/fees.module';
+import { BillingModule } from './billing/billing.module';
+import { OpenApiModule } from './openapi/openapi.module';
 
 @Module({
   imports: [
@@ -32,6 +34,8 @@ import { FeesModule } from './fees/fees.module';
     ReviewsModule,
     NotificationsModule,
     FeesModule,
+    BillingModule,
+    OpenApiModule,
   ],
 })
 export class AppModule {}

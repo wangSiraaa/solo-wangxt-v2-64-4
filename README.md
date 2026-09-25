@@ -18,6 +18,17 @@ NestJS + PostgreSQL + TypeORM + decimal.js 的服务端流程。**无前端**。
 7. **同一天不能出现重叠生效等级**：服务层显式校验 + PostgreSQL `btree_gist` 的 daterange 排他约束双保险。月中换级时旧期间自动截至生效日前一日（半开区间首尾相接）。
 8. **费用按天分段**：等级期间 × 日费版本切换日二次切分，闭区间逐天连续（含无生效等级空洞段），天数守恒校验；金额一律 decimal.js 计算，两位小数 `ROUND_HALF_UP`。
 9. **接口可解释**：评估响应内嵌两位评估员逐项明细（原始选项、分值、是否计入分母、NA 说明、原始分/有效分母/百分比/定级阈值）；费用分段逐段给出等级、日费版本、天数、金额与来源。
+10. **月度账单可封账闭环**：账单按 老人×自然月 版本化，状态机
+    `DRAFT → TRIALED → CLOSED → REOPENED（旧版定格，派生新版本 TRIALED）→ SUPERSEDED`。
+    - 封账冻结四类快照：**等级期间、日费版本、家属告知、逐日明细**（逐行携带等级期间 id 与日费版本 id，重启后每日来源可回放）；
+    - 封账后数据变化（费率补录、评估更正）**绝不静默改写已封账金额**，差异只生成 `OPEN` 跨期调整建议（`RATE_CHANGED`/`GRADE_CHANGED`，逐天冻结值/现值/差额），差异消失自动撤销；
+    - 重开**必须填写原因**，从原封账快照派生 `version_no+1` 的新版本（当前数据重算）；重算失败事务整体回滚，**旧封账保持可用、无新版本/半套明细**，并留 `RECOMPUTE_FAILED` 事件；
+    - 新版本再封账后旧版变 `SUPERSEDED`，其未决调整建议自动置 `INCORPORATED` 并指向新版本；
+    - 并发安全：服务端事务 + 行锁 + `pg_advisory_xact_lock(老人×月份)` 串行化，
+      数据库部分唯一索引兜底——同月份最多一个工作版本（`DRAFT/TRIALED`）、最多一个有效封账（`CLOSED`）；
+      重复封账/重复试算幂等回放，重复/并发重开仅产生一个新版本；
+    - 全部生命周期（试算/封账/重开/替代/调整建议/重算失败）写审计事件，版本链双向指针（`derivedFromBillId` / `supersededByBillId`），重启可回放；
+    - 未封账的 `GET /fees/segments` 查询行为与响应结构保持完全兼容（仍按当前数据实时计算）。
 
 ## 演示数据
 
@@ -48,7 +59,14 @@ npm test              # e2e（自带嵌入式 PG，覆盖下列全部场景）
 | POST | `/assessments/:id/notification/attempt` | 家属告知尝试（`{"simulateFail":true}` 模拟通道失败） |
 | GET | `/assessments/:id/notification` | 全部告知记录（失败历史、未确认尝试均保留） |
 | POST | `/fees/activate` | 等级生效 `{caseId, effectiveDate}` |
-| GET | `/fees/segments?elderId=&from=&to=` | 按天分段费用与 decimal 合计 |
+| GET | `/fees/segments?elderId=&from=&to=` | 按天分段费用与 decimal 合计（未封账原费用查询，兼容） |
+| POST | `/billing/bills/trial` | 试算：`{elderId, billMonth:"YYYY-MM", actor?}` → 生成/幂等刷新工作版本（TRIALED） |
+| GET | `/billing/bills?elderId=&billMonth?=` | 版本链：列出老人全部账单版本（按月份/版本号） |
+| GET | `/billing/bills/:billId` | 账单详情：状态/合计/冻结快照/逐日明细/合并分段/调整建议/事件 |
+| POST | `/billing/bills/:billId/close` | 封账：封账前重算并冻结四类快照；重复封账幂等回放 |
+| POST | `/billing/bills/:billId/reopen` | 重开：`{reason, actor?}` 必填原因，旧版 REOPENED + 派生新版本 |
+| POST | `/billing/bills/:billId/diff` | 差异查询：冻结基线 vs 当前数据，只生成/刷新 OPEN 调整建议 |
+| GET | `/openapi.json` | OpenAPI 3.0 描述文档（零依赖程序化构建） |
 
 ### 示例：月中升级 + 闰月
 
@@ -74,3 +92,13 @@ curl -s 'localhost:3000/api/fees/segments?elderId=E1&from=2024-02-01&to=2024-02-
 - 尚未确认尝试告知 → `UNCONFIRMED/FAILED`；送达失败原因分行留痕；
 - 月中升级切旧区间、同案重复生效回放、同日不同等级重叠 409；
 - 闰月 2024-02（29 天）分段金额、跨 2024-01-01 调价日同等级二次分段、无等级空洞段、非法闰日期拒绝。
+
+### 月度账单闭环 e2e（`test/billing.e2e-spec.ts`）
+
+- 闰月内月中换级（2/1~2/14 LIGHT@100、2/15~2/29 SEVERE@300，29 天守恒）试算封出逐行/分段可解释明细，封账冻结等级期间/日费版本/告知/逐日明细四类快照；
+- 重复试算刷新同一工作版本；重复/并发试算与封账仅一个版本且仅一个有效 `CLOSED`；封账后绕过重开另起草稿 409；
+- 封账后补录费率（LIGHT 100→120）：原账 5900.00 与快照不变，diff 逐天生成 14 条 `RATE_CHANGED` 建议（+280.00，幂等不重复挂账）；`/fees/segments` 仍按当前数据返回 6180.00；
+- 重开缺原因 400；注入重算失败 → 422 且旧封账仍 CLOSED 可用、无新版本、29 行明细完好、留 `RECOMPUTE_FAILED` 事件；
+- 正常重开派生 v2（TRIALED，当前口径 6180.00）；并发重开仅一个新版本；封 v2 后 v1 `SUPERSEDED`、调整建议 `INCORPORATED` 指向 v2、版本链指针双向闭合；
+- 封账后评估更正（等级期间 LIGHT→MODERATE）生成 `GRADE_CHANGED` 建议（+1120.00）原账不变；数据恢复后 OPEN 建议自动撤销；
+- 重启 Nest 应用后：版本状态/金额、逐日来源 id、快照、调整关系与事件链完整回放，`/fees/segments` 兼容结构不变。

@@ -16,5 +16,6 @@ import { FeesService } from './fees.service';
   ],
   controllers: [FeesController],
   providers: [FeesService],
+  exports: [FeesService],
 })
 export class FeesModule {}
